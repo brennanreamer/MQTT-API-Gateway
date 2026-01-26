@@ -16,7 +16,7 @@ from typing import Optional, Any
 from contextlib import asynccontextmanager
 
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, HTTPException, Depends, Query, status
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
@@ -179,6 +179,44 @@ class MessageStore:
                 "max_messages_per_topic": self._max_messages,
                 "retention_hours": self._retention_hours
             }
+    
+    def get_latest_by_prefix(self, prefix: str, history_count: int = 1) -> list[dict]:
+        """
+        Get messages for all topics matching a prefix.
+        
+        Args:
+            prefix: Topic prefix to match (e.g., "factory/line1/tank01/")
+                   Matches any topic that starts with this prefix.
+            history_count: Number of historical messages to return per topic.
+                          Default is 1 (just the latest). Max is limited by stored messages.
+        
+        Returns:
+            List of dicts with topic and messages (each containing timestamp and payload).
+        """
+        with self._lock:
+            results = []
+            for topic, messages in self._store.items():
+                if topic.startswith(prefix) and len(messages) > 0:
+                    # Get the requested number of messages, newest first
+                    msg_list = list(messages)
+                    msg_list.reverse()  # Newest first
+                    msg_list = msg_list[:history_count]
+                    
+                    if history_count == 1:
+                        # Single message format (backward compatible)
+                        results.append({
+                            "topic": topic,
+                            "timestamp": msg_list[0]["timestamp"],
+                            "payload": msg_list[0]["payload"]
+                        })
+                    else:
+                        # Multiple messages format
+                        results.append({
+                            "topic": topic,
+                            "message_count": len(msg_list),
+                            "messages": msg_list
+                        })
+            return results
 
 
 # Initialize message store
@@ -422,6 +460,13 @@ class HealthResponse(BaseModel):
     storage_stats: dict
 
 
+class BulkLatestResponse(BaseModel):
+    """Response for getting latest values of multiple topics matching a prefix."""
+    prefix: str
+    topic_count: int
+    values: list[dict]
+
+
 # =============================================================================
 # API Endpoints
 # =============================================================================
@@ -434,12 +479,14 @@ async def root():
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
-async def health_check():
+async def health_check(username: str = Depends(verify_credentials)):
     """
     Health check endpoint.
     
     Returns the current status of the gateway, including MQTT connection
     status and storage statistics.
+    
+    Requires authentication.
     """
     logger.info("DEBUG: /health endpoint called")
     mqtt_connected = mqtt_client is not None and mqtt_client.is_connected()
@@ -515,6 +562,41 @@ async def get_message_history(
         topic=topic,
         message_count=len(messages),
         messages=messages
+    )
+
+
+@app.get("/bulk/{prefix:path}", response_model=BulkLatestResponse, tags=["Bulk"])
+async def get_bulk_latest(
+    prefix: str,
+    username: str = Depends(verify_credentials),
+    x_history_count: Optional[int] = Header(default=1, alias="X-History-Count", ge=1, le=1000)
+):
+    """
+    Get values for ALL topics matching a prefix.
+    
+    This is useful for getting all values under a parent topic path at once.
+    For example, to get all process data for a tank, use:
+    /bulk/factory/line1/tank01/processdata/
+    
+    This will return values for every topic that starts with that prefix,
+    such as:
+    - factory/line1/tank01/processdata/temperature
+    - factory/line1/tank01/processdata/pressure
+    - factory/line1/tank01/processdata/level
+    - etc.
+    
+    The prefix should be URL-encoded (spaces as %20).
+    
+    **Headers:**
+    - `X-History-Count`: Number of historical messages to return per topic (default: 1, max: 1000).
+      When set to 1, returns just the latest value. When > 1, returns an array of messages per topic.
+    """
+    values = message_store.get_latest_by_prefix(prefix, history_count=x_history_count)
+    
+    return BulkLatestResponse(
+        prefix=prefix,
+        topic_count=len(values),
+        values=values
     )
 
 
