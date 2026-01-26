@@ -216,10 +216,13 @@ def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
 
 
 _message_count = 0
+_last_yield_time = 0
 
 def on_message(client, userdata, msg):
     """Callback when a message is received."""
-    global _message_count
+    global _message_count, _last_yield_time
+    import time
+    
     try:
         # Try to decode payload as JSON, fallback to string
         try:
@@ -230,8 +233,14 @@ def on_message(client, userdata, msg):
         message_store.add_message(msg.topic, payload)
         _message_count += 1
         
-        # Log every 100 messages to avoid log spam but track activity
-        if _message_count % 100 == 0:
+        # Yield to other threads periodically to prevent GIL starvation
+        current_time = time.time()
+        if current_time - _last_yield_time > 0.1:  # Every 100ms
+            time.sleep(0.001)  # Brief yield to allow HTTP thread to process
+            _last_yield_time = current_time
+        
+        # Log every 1000 messages to reduce log spam
+        if _message_count % 1000 == 0:
             logger.info(f"DEBUG: Received {_message_count} total messages")
         
     except Exception as e:
