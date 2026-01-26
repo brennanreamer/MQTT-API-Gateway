@@ -215,8 +215,11 @@ def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
         logger.info("Unexpected disconnection. Will attempt to reconnect...")
 
 
+_message_count = 0
+
 def on_message(client, userdata, msg):
     """Callback when a message is received."""
+    global _message_count
     try:
         # Try to decode payload as JSON, fallback to string
         try:
@@ -225,7 +228,11 @@ def on_message(client, userdata, msg):
             payload = msg.payload.decode("utf-8", errors="replace")
         
         message_store.add_message(msg.topic, payload)
-        logger.debug(f"Received message on {msg.topic}")
+        _message_count += 1
+        
+        # Log every 100 messages to avoid log spam but track activity
+        if _message_count % 100 == 0:
+            logger.info(f"DEBUG: Received {_message_count} total messages")
         
     except Exception as e:
         logger.error(f"Error processing message: {e}")
@@ -275,7 +282,8 @@ def start_mqtt_client():
         logger.info("MQTT client loop started")
     except Exception as e:
         logger.error(f"Failed to connect to MQTT broker: {e}")
-        raise
+        logger.warning("App will continue running - MQTT will retry automatically")
+        # Don't raise - let the app start anyway, MQTT client will retry
 
 
 def stop_mqtt_client():
@@ -313,13 +321,18 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     # Startup
     logger.info("Starting MQTT API Gateway...")
+    logger.info(f"DEBUG: PORT env = {os.environ.get('PORT', 'NOT SET')}")
+    logger.info(f"DEBUG: About to start MQTT client...")
     start_mqtt_client()
+    logger.info(f"DEBUG: MQTT client started, creating cleanup task...")
     
     # Start background cleanup task
     cleanup_task_handle = asyncio.create_task(cleanup_task())
+    logger.info(f"DEBUG: Cleanup task created, yielding to app...")
     
     yield
     
+    logger.info(f"DEBUG: App shutting down...")
     # Shutdown
     logger.info("Shutting down MQTT API Gateway...")
     cleanup_task_handle.cancel()
@@ -404,6 +417,13 @@ class HealthResponse(BaseModel):
 # API Endpoints
 # =============================================================================
 
+@app.get("/", tags=["Root"])
+async def root():
+    """Simple root endpoint for basic connectivity test."""
+    logger.info("DEBUG: / root endpoint called")
+    return {"status": "ok", "message": "MQTT API Gateway is running"}
+
+
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """
@@ -412,7 +432,9 @@ async def health_check():
     Returns the current status of the gateway, including MQTT connection
     status and storage statistics.
     """
+    logger.info("DEBUG: /health endpoint called")
     mqtt_connected = mqtt_client is not None and mqtt_client.is_connected()
+    logger.info(f"DEBUG: mqtt_connected = {mqtt_connected}")
     
     return HealthResponse(
         status="healthy" if mqtt_connected else "degraded",
@@ -494,10 +516,12 @@ async def get_message_history(
 if __name__ == "__main__":
     import uvicorn
     
+    port = int(os.environ.get("PORT", 8000))
+    
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=False,
         workers=1  # Single worker to share MQTT connection state
     )
